@@ -1,0 +1,440 @@
+# inference_hier.py (revised)
+# Multi-instance 3D inference for hierarchical U-Net (semantic + profile)
+import os, sys, json, time
+from typing import Optional, Dict, List, Tuple
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import bpy
+
+# -----------------------------------------------------------------------------
+# Paths & basic config
+# -----------------------------------------------------------------------------
+BLEND_DIR = os.path.dirname(bpy.data.filepath)
+if BLEND_DIR and BLEND_DIR not in sys.path:
+    sys.path.insert(0, BLEND_DIR)
+
+from tof_helpers import extract_points_from_object  # -> torch.FloatTensor (N,3) WORLD
+
+RUN_NAME = "unet3d_tsdf_densityrobust_hier"
+CKPT_DIR = os.path.join(BLEND_DIR, "checkpoints", RUN_NAME)
+CKPT_PATH = os.path.join(CKPT_DIR, "best.pth")
+META_PATH = os.path.join(CKPT_DIR, "meta.json")
+
+OBJ_NAME   = "SceneSensor"   # your sensor object
+DETS_COLLECTION = "Detections"
+
+# Inference knobs
+GRID_SIZE          = 112        # you can set 128 to match training
+VOXEL_SIZE_SCALE   = 1.0        # lower = finer grid (more voxels); we will auto-fit anyway
+USE_AUTO_FIT_VOXEL = True       # <<< enable to match training behavior
+AUTO_FIT_COVER_Q   = 0.95
+AUTO_FIT_VS_MIN    = 0.01
+AUTO_FIT_VS_MAX    = 0.20
+PAD_EMPTY_BORDER   = 1
+
+TSDF_MAX_POINTS    = 120_000
+TSDF_TRUNC_MIN     = 0.08       # final trunc = max(3*vs, TSDF_TRUNC_MIN)
+
+CONF_THRESH        = 0.0        # 0.0 disables; try 0.50–0.65 if too many false blobs
+MIN_VOXELS_PER_OBJ = 20         # drop very small blobs
+BACKGROUND_ID      = 0
+
+# -----------------------------------------------------------------------------
+# Blender helpers
+# -----------------------------------------------------------------------------
+def _ensure_collection(name: str) -> bpy.types.Collection:
+    col = bpy.data.collections.get(name)
+    if col is None:
+        col = bpy.data.collections.new(name)
+        bpy.context.scene.collection.children.link(col)
+    return col
+
+def _upsert_empty(name: str, location, collection: bpy.types.Collection, color=(1,1,1,1)):
+    obj = bpy.data.objects.get(name)
+    if obj is None:
+        obj = bpy.data.objects.new(name, None)
+        obj.empty_display_type = 'SPHERE'
+        obj.empty_display_size = 0.08
+        collection.objects.link(obj)
+    obj.location = location
+    obj.color = color
+    obj.display_type = 'WIRE'
+    obj.hide_render = True
+    return obj
+
+def _upsert_bbox(name: str, center, half_extents, collection: bpy.types.Collection, color=(1,1,1,1)):
+    obj = bpy.data.objects.get(name)
+    if obj is None:
+        bpy.ops.mesh.primitive_cube_add(size=2.0, location=center)
+        obj = bpy.context.active_object
+        obj.name = name
+        for c in obj.users_collection:
+            c.objects.unlink(obj)
+        collection.objects.link(obj)
+    obj.location = center
+    obj.scale = half_extents
+    obj.display_type = 'WIRE'
+    obj.hide_render = True
+    obj.color = color
+    return obj
+
+# -----------------------------------------------------------------------------
+# Feature builder (6ch) — mirrors training
+# -----------------------------------------------------------------------------
+def _auto_fit_voxel_size(points_m: np.ndarray,
+                         grid_size: int,
+                         desired_vs: float,
+                         cover_frac: float,
+                         pad_empty_border: int,
+                         vs_min: float,
+                         vs_max: float) -> float:
+    if points_m.shape[0] == 0:
+        return desired_vs
+    c = points_m.mean(axis=0, keepdims=True)
+    R = points_m - c
+    r = np.max(np.abs(R), axis=1)
+    L_needed = max(2.0 * float(np.quantile(r, cover_frac)), 1e-6)
+    vs = L_needed / float(grid_size - 2*pad_empty_border)
+    vs = float(np.clip(vs, vs_min, vs_max))
+    return max(vs, desired_vs)  # only grow
+
+def voxelize(points_m: np.ndarray, voxel_size_m: float, grid_size: int):
+    c = points_m.mean(axis=0, keepdims=True)
+    half = (grid_size * voxel_size_m) / 2.0
+    mn = (c[0] - half)
+    gc = np.floor((points_m - mn) / voxel_size_m).astype(np.int32)
+    mask = np.all((gc >= 0) & (gc < grid_size), axis=1)
+    gc = gc[mask]
+    if gc.size == 0:
+        return mn, np.zeros((0,3),np.int32), np.zeros((0,),np.int64), np.zeros((0,),np.int32), mask
+    U, inv = np.unique(gc, axis=0, return_inverse=True)
+    counts = np.bincount(inv, minlength=U.shape[0]).astype(np.int32)
+    return mn, U, inv.astype(np.int64), counts, mask
+
+def tsdf_sparse(points_m: np.ndarray,
+                uc_np: np.ndarray,
+                grid_origin_m: np.ndarray,
+                voxel_size_m: float,
+                trunc_m: float,
+                max_points: int = TSDF_MAX_POINTS) -> Tuple[np.ndarray,np.ndarray]:
+    if uc_np.shape[0] == 0:
+        return np.zeros((0,),np.float32), np.zeros((0,),np.float32)
+    P = points_m
+    if P.shape[0] > max_points:
+        sel = np.random.choice(P.shape[0], max_points, replace=False)
+        P = P[sel]
+    occ = set(map(tuple, np.floor((P - grid_origin_m) / voxel_size_m).astype(np.int32).tolist()))
+    centers = grid_origin_m + (uc_np.astype(np.float32) + 0.5) * voxel_size_m
+    M = uc_np.shape[0]
+    tsdf = np.empty((M,), np.float32); w = np.empty((M,), np.float32)
+    for i in range(M):
+        c = centers[i]
+        d = trunc_m + 2*voxel_size_m
+        m = ((P[:,0] >= c[0]-d) & (P[:,0] <= c[0]+d) &
+             (P[:,1] >= c[1]-d) & (P[:,1] <= c[1]+d) &
+             (P[:,2] >= c[2]-d) & (P[:,2] <= c[2]+d))
+        Q = P[m]
+        if Q.shape[0] == 0:
+            tsdf[i] = trunc_m; w[i] = 0.0; continue
+        dist = np.sqrt(np.sum((Q - c)*(Q - c), axis=1))
+        dmin = dist.min()
+        sign = -1.0 if tuple(uc_np[i]) in occ else +1.0
+        tsdf[i] = np.clip(sign * dmin, -trunc_m, trunc_m)
+        w[i]    = float((dist <= trunc_m).sum()) / max(1, Q.shape[0])
+    tsdf /= max(trunc_m, 1e-6)
+    return tsdf, w
+
+def build_feature_grid_infer(points_m: np.ndarray,
+                             base_voxel_size_m: float,
+                             grid_size: int):
+    """Auto-fit vs (optional), build 6ch features, and return meta."""
+    # auto-fit (match training behavior)
+    vs_used = base_voxel_size_m
+    if USE_AUTO_FIT_VOXEL:
+        vs_used = _auto_fit_voxel_size(points_m, grid_size,
+                                       base_voxel_size_m,
+                                       AUTO_FIT_COVER_Q,
+                                       PAD_EMPTY_BORDER,
+                                       AUTO_FIT_VS_MIN,
+                                       AUTO_FIT_VS_MAX)
+    # voxelize
+    origin, uc, inv, counts, valid_mask = voxelize(points_m, vs_used, grid_size)
+
+    # dense base
+    feats_dense = np.zeros((4, grid_size, grid_size, grid_size), np.float32)
+    if uc.shape[0] > 0:
+        ucn = (uc.astype(np.float32) / max(grid_size-1, 1)) * 2.0 - 1.0
+        gx, gy, gz = uc[:,0], uc[:,1], uc[:,2]
+        feats_dense[0, gx, gy, gz] = ucn[:,0]
+        feats_dense[1, gx, gy, gz] = ucn[:,1]
+        feats_dense[2, gx, gy, gz] = ucn[:,2]
+        feats_dense[3, gx, gy, gz] = 1.0
+
+    # TSDF + weight
+    tsdf_grid = np.zeros((grid_size, grid_size, grid_size), np.float32)
+    w_grid    = np.zeros_like(tsdf_grid)
+    if uc.shape[0] > 0:
+        trunc = max(3.0*vs_used, TSDF_TRUNC_MIN)
+        tsdf_np, w_np = tsdf_sparse(points_m, uc, origin, vs_used, trunc)
+        gx, gy, gz = uc[:,0], uc[:,1], uc[:,2]
+        tsdf_grid[gx,gy,gz] = tsdf_np
+        w_grid[gx,gy,gz]    = w_np
+
+    feats = np.concatenate([feats_dense, np.stack([tsdf_grid, w_grid], axis=0)], axis=0)
+    meta = dict(uc=uc, inv=inv, valid_mask=valid_mask,
+                grid_origin_m=origin, voxel_size_m=float(vs_used))
+    return feats, meta
+
+# -----------------------------------------------------------------------------
+# Model (two-head U-Net) — must match training
+# -----------------------------------------------------------------------------
+class ConvGNReLU(nn.Module):
+    def __init__(self, c_in, c_out, k=3, s=1):
+        super().__init__()
+        p = k//2
+        g = min(16, max(1, c_out//2))
+        self.block = nn.Sequential(
+            nn.Conv3d(c_in, c_out, k, s, p, bias=False),
+            nn.GroupNorm(g, c_out),
+            nn.ReLU(inplace=True)
+        )
+    def forward(self, x): return self.block(x)
+
+class UNet3DTwoHead(nn.Module):
+    def __init__(self, in_ch, n_classes, n_profiles, base=32):
+        super().__init__()
+        self.enc1 = nn.Sequential(ConvGNReLU(in_ch, base), ConvGNReLU(base, base))
+        self.down1 = nn.Conv3d(base, base*2, 2, 2)
+        self.enc2 = nn.Sequential(ConvGNReLU(base*2, base*2), ConvGNReLU(base*2, base*2))
+        self.down2 = nn.Conv3d(base*2, base*4, 2, 2)
+        self.enc3 = nn.Sequential(ConvGNReLU(base*4, base*4), ConvGNReLU(base*4, base*4))
+        self.down3 = nn.Conv3d(base*4, base*8, 2, 2)
+        self.bott = nn.Sequential(ConvGNReLU(base*8, base*8), ConvGNReLU(base*8, base*8))
+        self.up3 = nn.ConvTranspose3d(base*8, base*4, 2, 2)
+        self.dec3 = nn.Sequential(ConvGNReLU(base*8, base*4), ConvGNReLU(base*4, base*4))
+        self.up2 = nn.ConvTranspose3d(base*4, base*2, 2, 2)
+        self.dec2 = nn.Sequential(ConvGNReLU(base*4, base*2), ConvGNReLU(base*2, base*2))
+        self.up1 = nn.ConvTranspose3d(base*2, base, 2, 2)
+        self.dec1 = nn.Sequential(ConvGNReLU(base*2, base), ConvGNReLU(base, base))
+        self.head_sem  = nn.Conv3d(base, n_classes, 1)
+        self.head_prof = nn.Conv3d(base, n_profiles, 1)
+    def forward(self, x):
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.down1(e1))
+        e3 = self.enc3(self.down2(e2))
+        b  = self.bott(self.down3(e3))
+        d3 = self.dec3(torch.cat([self.up3(b), e3], dim=1))
+        d2 = self.dec2(torch.cat([self.up2(d3), e2], dim=1))
+        d1 = self.dec1(torch.cat([self.up1(d2), e1], dim=1))
+        return self.head_sem(d1), self.head_prof(d1)
+
+# -----------------------------------------------------------------------------
+# Profile masking (same as training)
+# -----------------------------------------------------------------------------
+def mask_prof_logits_illegal(prof_logits: torch.Tensor,
+                             pred_sem: torch.Tensor,
+                             allowed_per_class: Dict[int, List[int]]) -> torch.Tensor:
+    if not allowed_per_class:
+        return prof_logits
+    out = prof_logits.clone()
+    B, P = out.shape[:2]
+    device = out.device
+    neg_large = torch.finfo(out.dtype).min
+    for c, allowed in allowed_per_class.items():
+        illegal = torch.ones(P, dtype=torch.bool, device=device)
+        if allowed:
+            idx = torch.tensor(sorted([int(x) for x in allowed]), device=device, dtype=torch.long)
+            illegal[idx] = False
+        mask_vox = (pred_sem == int(c)).unsqueeze(1)            # (B,1,D,H,W)
+        mask_full = mask_vox & illegal.view(1, P, 1, 1, 1)
+        out.masked_fill_(mask_full, neg_large)
+    return out
+
+# -----------------------------------------------------------------------------
+# Connected components on sparse coords
+# -----------------------------------------------------------------------------
+_NEIGH6 = np.array([[+1,0,0],[-1,0,0],[0,+1,0],[0,-1,0],[0,0,+1],[0,0,-1]], dtype=np.int32)
+def components_sparse(active_uc: np.ndarray) -> List[np.ndarray]:
+    if active_uc.shape[0] == 0:
+        return []
+    key2idx = { (int(x),int(y),int(z)) : i for i,(x,y,z) in enumerate(active_uc) }
+    visited = np.zeros((active_uc.shape[0],), dtype=np.bool_)
+    comps = []
+    for i in range(active_uc.shape[0]):
+        if visited[i]: continue
+        stack = [i]; visited[i] = True; comp = [i]
+        while stack:
+            j = stack.pop()
+            x,y,z = active_uc[j]
+            for dx,dy,dz in _NEIGH6:
+                k = key2idx.get((int(x+dx), int(y+dy), int(z+dz)))
+                if k is not None and not visited[k]:
+                    visited[k] = True; stack.append(k); comp.append(k)
+        comps.append(np.array(comp, dtype=np.int64))
+    return comps
+
+# -----------------------------------------------------------------------------
+# Engine
+# -----------------------------------------------------------------------------
+class _Engine:
+    def __init__(self, ckpt_path: str, meta_path: str, grid_size: int):
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        self.meta = meta
+        self.classes  = meta["classes"]
+        self.profiles = meta.get("profiles", [])
+        self.allowed_per_class = {int(k): v for k, v in meta.get("allowed_per_class", {}).items()}
+
+        self.voxel_size_base = float(meta.get("voxel_size", 0.03))
+        self.grid_size = grid_size
+
+        # human class id
+        self.human_cid = None
+        for i, c in enumerate(self.classes):
+            if "human" in c.lower():
+                self.human_cid = i; break
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = device
+        n_classes  = len(self.classes)
+        n_profiles = max(1, len(self.profiles))
+
+        self.model = UNet3DTwoHead(in_ch=6, n_classes=n_classes, n_profiles=n_profiles, base=32).to(device)
+        state = torch.load(ckpt_path, map_location=device)
+        try:
+            self.model.load_state_dict(state, strict=True)
+        except RuntimeError:
+            new_state = { (k.replace("module.","") if k.startswith("module.") else k): v for k,v in state.items() }
+            self.model.load_state_dict(new_state, strict=True)
+        self.model.eval()
+        print(f"[INF] Loaded {ckpt_path} on {device} | classes={self.classes}")
+
+_ENGINE = _Engine(CKPT_PATH, META_PATH, GRID_SIZE)
+
+# -----------------------------------------------------------------------------
+# Inference
+# -----------------------------------------------------------------------------
+def infer_object(obj_name: str):
+    t0 = time.perf_counter()
+    if obj_name not in bpy.data.objects:
+        print(f"[INF] Object '{obj_name}' not found.")
+        return
+
+    # 1) extract points (WORLD)
+    P_t = extract_points_from_object(bpy.data.objects[obj_name])
+    P = P_t.detach().cpu().numpy().astype(np.float32)
+    if P.shape[0] == 0:
+        print(f"[INF] '{obj_name}' has 0 points.")
+        return
+    t1 = time.perf_counter()
+
+    # 2) features with AUTO-FIT voxel size
+    vs_base = _ENGINE.voxel_size_base * float(VOXEL_SIZE_SCALE)
+    feats_np, meta = build_feature_grid_infer(P, vs_base, _ENGINE.grid_size)
+    X = torch.from_numpy(feats_np).unsqueeze(0).to(_ENGINE.device)
+    vs_used = float(meta["voxel_size_m"])
+    t2 = time.perf_counter()
+
+    # 3) forward
+    with torch.no_grad():
+        logits_c, logits_p = _ENGINE.model(X)             # (1,C,D,H,W), (1,P,D,H,W)
+        probs_c = F.softmax(logits_c, dim=1)
+        pred_c  = probs_c.argmax(1)                       # (1,D,H,W)
+        # Optional confidence gating
+        if CONF_THRESH > 0.0:
+            conf = probs_c.max(1).values                  # (1,D,H,W)
+            bg_mask = conf < CONF_THRESH
+            pred_c = pred_c.clone()
+            pred_c[bg_mask] = BACKGROUND_ID
+        # Profiles (masked by predicted classes)
+        if _ENGINE.allowed_per_class:
+            logits_p = mask_prof_logits_illegal(logits_p, pred_c, _ENGINE.allowed_per_class)
+        pred_p = logits_p.argmax(1)
+    t3 = time.perf_counter()
+
+    # 3.5) diagnostics — class histogram over active coords
+    uc = meta["uc"]; inv = meta["inv"]; valid_mask = meta["valid_mask"]
+    active = uc.shape[0]
+    if active > 0:
+        gx, gy, gz = uc[:,0], uc[:,1], uc[:,2]
+        pred_dense = pred_c[0].cpu().numpy()
+        pred_on_uc = pred_dense[gx, gy, gz]
+        ids, cnts = np.unique(pred_on_uc, return_counts=True)
+        total_uc = pred_on_uc.size
+        hist = sorted([(int(i), int(c), float(c)/max(1,total_uc)) for i,c in zip(ids, cnts)],
+                      key=lambda t: -t[1])
+        top = ", ".join([f"{_ENGINE.classes[i]}:{c} ({p*100:.1f}%)" for i,c,p in hist[:5]])
+        print(f"[DBG] Active voxels={active} ({active/(_ENGINE.grid_size**3):.3%} grid fill). "
+              f"Top classes on active: {top if top else '—'}")
+    else:
+        print("[DBG] No active voxels after voxelization.")
+
+    # 4) map voxel predictions back to points (optional)
+    point_sem = np.full((P.shape[0],), -1, np.int32)
+    point_prof= np.full((P.shape[0],), -1, np.int32)
+    if uc.shape[0] > 0 and inv.shape[0] > 0:
+        gx, gy, gz = uc[:,0], uc[:,1], uc[:,2]
+        pred_c_dense = pred_c[0].cpu().numpy()
+        pred_p_dense = pred_p[0].cpu().numpy()
+        active_sem = pred_c_dense[gx, gy, gz]
+        active_prof= pred_p_dense[gx, gy, gz]
+        point_sem[valid_mask]  = active_sem[inv]
+        point_prof[valid_mask] = active_prof[inv]
+    t4 = time.perf_counter()
+
+    # 5) multi-instance human components
+    placed = 0
+    if (_ENGINE.human_cid is not None) and (uc.shape[0] > 0):
+        gx, gy, gz = uc[:,0], uc[:,1], uc[:,2]
+        pred_c_dense = pred_c[0].cpu().numpy()
+        human_mask_sparse = (pred_c_dense[gx, gy, gz] == _ENGINE.human_cid)
+        uc_h = uc[human_mask_sparse]
+        human_frac = float(human_mask_sparse.sum())/max(1, uc.shape[0])
+        print(f"[DBG] Human voxels among active: {human_mask_sparse.sum()} ({human_frac*100:.2f}%)")
+        comps = components_sparse(uc_h)
+        col = _ensure_collection(DETS_COLLECTION)
+        origin = np.asarray(meta["grid_origin_m"], np.float32)
+        vsz = float(meta["voxel_size_m"])
+
+        for comp_idx, idxs in enumerate(comps):
+            if idxs.size < MIN_VOXELS_PER_OBJ:
+                continue
+            vox = uc_h[idxs]                         # (K,3)
+            centers = origin + (vox.astype(np.float32) + 0.5) * vsz
+            centroid = centers.mean(axis=0)
+            mins = centers.min(axis=0); maxs = centers.max(axis=0)
+            half_extents = 0.5*(maxs - mins)
+            half_extents = np.maximum(half_extents, 0.02)
+
+            color = (0.2, 0.8, 0.2, 1.0)
+            base = f"Human_{comp_idx:02d}"
+            _upsert_empty(base + "_centroid", centroid, col, color)
+            _upsert_bbox(base + "_bbox", centroid, half_extents, col, color)
+            placed += 1
+
+    # 6) final report
+    valid = (point_sem >= 0)
+    maj_name = "unlabeled"; maj_id = -1
+    if valid.any():
+        ids, cnts = np.unique(point_sem[valid], return_counts=True)
+        k = int(cnts.argmax())
+        maj_id = int(ids[k])
+        maj_name = _ENGINE.classes[maj_id] if 0 <= maj_id < len(_ENGINE.classes) else str(maj_id)
+
+    t5 = time.perf_counter()
+    print(f"[INF] {obj_name}: majority={maj_name} ({maj_id}) | "
+          f"extract={(t1-t0)*1000:.1f}ms voxel={(t2-t1)*1000:.1f}ms "
+          f"net={(t3-t2)*1000:.1f}ms map={(t4-t3)*1000:.1f}ms instances={(t5-t4)*1000:.1f}ms "
+          f"(grid={_ENGINE.grid_size}^3 vs_used={vs_used:.4f} in_ch=6 placed={placed})")
+
+    return {
+        "points_sem": point_sem, "points_prof": point_prof,
+        "placed": placed, "majority_id": maj_id, "majority_name": maj_name,
+        "vs_used": vs_used
+    }
+
+if __name__ == "__main__":
+    infer_object(OBJ_NAME)

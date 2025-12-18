@@ -1,0 +1,793 @@
+# detect_and_boxes_fast_crop_pad.py
+# Fast inference with: active-ROI crop, fp16+pinned upload, cached model,
+# AND padding cropped tensors to multiples of 16 to satisfy UNet down/upsampling.
+# Post-decoding: connect/merge candidates that share profile (and class) AND overlap.
+
+import os, sys, json, time, types, gc
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# ------------------------ path bootstrap so "models" is importable ------------
+try:
+    import bpy
+    BLEND_DIR = os.path.dirname(bpy.data.filepath)
+except Exception:
+    BLEND_DIR = os.getcwd()
+
+for root in [
+    BLEND_DIR,
+    os.path.dirname(BLEND_DIR),
+    os.path.join(BLEND_DIR, "scripts"),
+    os.path.join(BLEND_DIR, ".."),
+]:
+    if os.path.isdir(os.path.join(root, "models")) and (root not in sys.path):
+        sys.path.insert(0, os.path.abspath(root))
+        break
+
+from models.unet3d import UNet3DInstBEV  # your model
+
+# ------------------------------- global caches --------------------------------
+_DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+_MODEL_CACHE = None
+_META_CACHE  = None
+
+torch.backends.cudnn.benchmark = True
+torch.backends.cuda.matmul.allow_tf32 = True
+try:
+    torch.set_float32_matmul_precision("high")
+except Exception:
+    pass
+
+def to_cl3d_safe(t: torch.Tensor):
+    try:
+        if t.is_floating_point() and t.dim() == 5:
+            return t.contiguous(memory_format=torch.channels_last_3d)
+    except Exception:
+        pass
+    return t
+
+# ------------------------------- Blender helpers ------------------------------
+def get_points_from_bpy_object(object_name: str) -> np.ndarray:
+    import bpy
+    cands = [object_name, object_name.replace("_"," "), object_name.replace(" ","_")]
+    obj = None
+    for c in cands:
+        if c in bpy.data.objects:
+            obj = bpy.data.objects[c]; break
+    if obj is None:
+        lname = object_name.lower()
+        for o in bpy.data.objects:
+            if o.name.lower() == lname:
+                obj = o; break
+    if obj is None:
+        raise ValueError(f"Object '{object_name}' not found")
+
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    eval_obj = obj.evaluated_get(depsgraph)
+    if eval_obj.type != 'MESH':
+        raise TypeError(f"Object '{eval_obj.name}' is type {eval_obj.type}, expected MESH")
+
+    mesh = eval_obj.to_mesh()
+    try:
+        nv = len(mesh.vertices)
+        if nv == 0:
+            return np.zeros((0,3), dtype=np.float32)
+        flat = np.empty(nv*3, dtype=np.float32)
+        mesh.vertices.foreach_get("co", flat)
+        pts_local = flat.reshape(nv, 3)
+        M = np.array(eval_obj.matrix_world, dtype=np.float32)  # 4x4
+        pts_h = np.c_[pts_local, np.ones((nv,1), np.float32)]
+        pts_world = (pts_h @ M.T)[:, :3]
+    finally:
+        eval_obj.to_mesh_clear()
+    return pts_world
+
+def ensure_collection(name: str):
+    import bpy
+    coll = bpy.data.collections.get(name)
+    if not coll:
+        coll = bpy.data.collections.new(name)
+        bpy.context.scene.collection.children.link(coll)
+    return coll
+
+def make_emission_material(name: str, rgb=(1,1,1)):
+    import bpy
+    mat = bpy.data.materials.get(name) or bpy.data.materials.new(name)
+    mat.use_nodes = True
+    nt = mat.node_tree
+    for n in list(nt.nodes): nt.nodes.remove(n)
+    out = nt.nodes.new("ShaderNodeOutputMaterial"); out.location = (300,0)
+    emis = nt.nodes.new("ShaderNodeEmission"); emis.location = (0,0)
+    emis.inputs["Color"].default_value = (float(rgb[0]), float(rgb[1]), float(rgb[2]), 1.0)
+    emis.inputs["Strength"].default_value = 1.2
+    nt.links.new(emis.outputs["Emission"], out.inputs["Surface"])
+    return mat
+
+# ------------------------ model load + warmup (cached) ------------------------
+def load_model_once(ckpt_dir: str, ckpt_name: str = "best.pth"):
+    global _MODEL_CACHE, _META_CACHE
+    if _MODEL_CACHE is not None:
+        return _MODEL_CACHE, _META_CACHE
+
+    meta_path = os.path.join(ckpt_dir, "meta.json")
+    if not os.path.isfile(meta_path):
+        raise FileNotFoundError(f"meta.json not found: {meta_path}")
+    with open(meta_path, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+
+    classes_map   = meta.get("classes", {})
+    use_profiles  = bool(meta.get("use_profiles", True))
+    enable_bev    = bool(meta.get("enable_bev_head", True))
+
+    n_classes  = (max(int(v) for v in classes_map.values()) + 1) if classes_map else 1
+    n_profiles = len(meta.get("profiles", {})) if use_profiles else 0
+
+    model = UNet3DInstBEV(
+        in_ch=7, n_classes=n_classes, n_profiles=n_profiles,
+        base=32, enable_bev_head=enable_bev, bev_band_only=True
+    ).to(_DEVICE).eval()
+
+    try:
+        model.to(memory_format=torch.channels_last_3d)
+        for m in model.modules():
+            if isinstance(m, nn.Conv3d):
+                m.weight.data = m.weight.data.contiguous(memory_format=torch.channels_last_3d)
+        model._use_cl3d = True
+    except Exception as e:
+        print("[warn] channels_last_3d disabled:", e)
+        model._use_cl3d = False
+
+    state = torch.load(os.path.join(ckpt_dir, ckpt_name), map_location=_DEVICE)
+    model.load_state_dict(state, strict=True)
+
+    try:
+        model = torch.compile(model, mode="max-autotune")
+    except Exception:
+        pass
+
+    # warmup once
+    gs = int(meta.get("grid_size", 128))
+    with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=(_DEVICE.type=="cuda")):
+        dummy = torch.zeros((1,7,gs,gs,gs), device=_DEVICE, dtype=torch.float16)
+        dummy = to_cl3d_safe(dummy)
+        _ = model(dummy, band=dummy[:,5:6].contiguous())
+
+    _MODEL_CACHE, _META_CACHE = model, meta
+    return model, meta
+
+# ------------- FAST voxel features (no PCA/curv at inference) ----------------
+def fast_voxel_features(points: np.ndarray, cfg):
+    G = int(cfg.grid_size)
+    vs = float(cfg.voxel_size_m)
+    P = points
+    N = P.shape[0]
+
+    if N == 0:
+        origin = np.zeros(3, np.float32)
+        feats = np.zeros((7,G,G,G), np.float32)
+        meta = dict(grid_origin_m=origin, uc=np.zeros((0,3),np.int32),
+                    inv=np.zeros((0,),np.int64), valid_mask=np.zeros((0,),bool),
+                    voxel_size_m=vs, empty=True)
+        return feats, None, None, meta
+
+    # Auto-fit like training (cheap)
+    c = P.mean(0, keepdims=True)
+    R = P - c
+    r = np.max(np.abs(R), axis=1)
+    L_need = max(2.0 * float(np.quantile(r, getattr(cfg, "auto_fit_cover_frac", 0.95))), 1e-6)
+    vs_used = L_need / float(G - 2*getattr(cfg, "pad_empty_border", 1)) if getattr(cfg, "auto_fit_voxel_size", True) else vs
+    vs_used = float(np.clip(vs_used, getattr(cfg,"auto_fit_min_vs",0.01), getattr(cfg,"auto_fit_max_vs",0.20)))
+    vs = vs_used
+
+    half = (G * vs) / 2.0
+    origin = (c[0] - half).astype(np.float32)
+
+    gc = np.floor((P - origin)/vs).astype(np.int32)  # (N,3)
+    valid_mask = np.all((gc >= 0) & (gc < G), axis=1)
+    gc_in = gc[valid_mask]
+    if gc_in.size == 0:
+        feats = np.zeros((7,G,G,G), np.float32)
+        meta = dict(grid_origin_m=origin, uc=np.zeros((0,3),np.int32),
+                    inv=np.zeros((0,),np.int64), valid_mask=valid_mask,
+                    voxel_size_m=vs, empty=True)
+        return feats, None, None, meta
+
+    U, inv = np.unique(gc_in, axis=0, return_inverse=True)   # U: (V,3)
+    counts = np.bincount(inv, minlength=U.shape[0]).astype(np.int32)
+
+    feats_dense = np.zeros((4,G,G,G), np.float32)
+    n_norm_grid = np.zeros((G,G,G), np.float32)
+    band_grid   = np.zeros((G,G,G), np.float32)
+    curv_grid   = np.zeros((G,G,G), np.float32)
+
+    gx, gy, gz = U[:,0], U[:,1], U[:,2]
+    ucn = (U.astype(np.float32)/max(G-1,1))*2.0 - 1.0
+    ctr = ucn.mean(axis=0, keepdims=True).astype(np.float32)
+    ucn = ucn - ctr
+
+    feats_dense[0, gx, gy, gz] = ucn[:,0]
+    feats_dense[1, gx, gy, gz] = ucn[:,1]
+    feats_dense[2, gx, gy, gz] = ucn[:,2]
+    feats_dense[3, gx, gy, gz] = 1.0
+
+    max_cnt = float(counts.max()) if counts.size else 1.0
+    n_norm_grid[gx, gy, gz] = (counts.astype(np.float32) / max_cnt) if max_cnt > 0 else 0.0
+    band_grid[gx, gy, gz]   = 1.0
+
+    feats = np.concatenate(
+        [feats_dense, np.stack([n_norm_grid, band_grid, curv_grid], axis=0)],
+        axis=0
+    )
+    meta = dict(grid_origin_m=origin, uc=U.astype(np.int32), inv=inv.astype(np.int64),
+        valid_mask=valid_mask, voxel_size_m=vs, empty=False)
+    return feats, None, None, meta
+
+# ---------------------- Active ROI crop around occupied voxels ----------------
+def crop_active_roi(feats: np.ndarray, uc: np.ndarray, margin: int = 2):
+    if uc.size == 0:
+        return feats, dict(offset=(0,0,0), shape=feats.shape[1:])
+
+    gx, gy, gz = uc[:,0], uc[:,1], uc[:,2]
+    x0, y0, z0 = int(gx.min()), int(gy.min()), int(gz.min())
+    x1, y1, z1 = int(gx.max()), int(gy.max()), int(gz.max())
+
+    x0 = max(0, x0 - margin); y0 = max(0, y0 - margin); z0 = max(0, z0 - margin)
+    D,H,W = feats.shape[1:]
+    x1 = min(D-1, x1 + margin); y1 = min(H-1, y1 + margin); z1 = min(W-1, z1 + margin)
+
+    crop = feats[:, x0:x1+1, y0:y1+1, z0:z1+1]
+    meta = dict(offset=(x0, y0, z0), shape=(D,H,W))
+    return crop, meta
+
+# ----------------------- Pad to multiple-of-16 for UNet -----------------------
+def pad_to_multiple_3d(x_np: np.ndarray, multiple: int = 16):
+    _, D, H, W = x_np.shape
+    def need(n):
+        r = n % multiple
+        return 0 if r == 0 else (multiple - r)
+    pd = need(D); ph = need(H); pw = need(W)
+    if pd == ph == pw == 0:
+        return x_np, (0,0,0), (D,H,W)
+    x_pad = np.pad(x_np, ((0,0), (0,pd), (0,ph), (0,pw)), mode="constant")
+    return x_pad, (pd, ph, pw), (D,H,W)
+
+def unpad_logits_to_shape(logits, orig_shape):
+    D,H,W = orig_shape
+    return logits[..., :D, :H, :W]
+
+# ----------------------------- GPU decode (fast) ------------------------------
+def decode_gpu_fast(
+    logits_c, logits_p, logits_ctr, logits_off, meta_v,
+    center_thresh=0.35, nms_kernel=7, max_instances=512,
+    assign_radius_vox=6.0, topk_global=512, chunk_K=256
+):
+    device = logits_c.device
+    pred_c = logits_c.argmax(1)[0]
+    ctr    = torch.sigmoid(logits_ctr)[0,0]
+    D,H,W  = pred_c.shape
+
+    uc = torch.as_tensor(meta_v["uc"], device=device, dtype=torch.long)
+    gx, gy, gz = uc[:,0], uc[:,1], uc[:,2]
+
+    mask_active = torch.zeros((D,H,W), dtype=torch.bool, device=device)
+    mask_active[gx,gy,gz] = True
+
+    k = nms_kernel; pad = (k-1)//2
+    pool = F.max_pool3d(ctr[None,None], kernel_size=k, stride=1, padding=pad)[0,0]
+    keep = (ctr >= center_thresh) & (ctr == pool) & mask_active
+    if not keep.any():
+        return dict(centers_vox=None, scores=None, assign=None, vox_cls=None, vox_prof=None, uc=uc)
+
+    cx, cy, cz = torch.where(keep)
+    scores = ctr[cx,cy,cz]
+
+    if scores.numel() > topk_global:
+        sel = torch.topk(scores, topk_global).indices
+        cx, cy, cz = cx[sel], cy[sel], cz[sel]
+        scores = scores[sel]
+
+    centers_vox = torch.stack([cx,cy,cz], dim=1).to(torch.float32)
+    K = centers_vox.shape[0]
+
+    # per-voxel estimated centers
+    if logits_off is not None:
+        off = logits_off[0]  # (3,D,H,W)
+        off_active = off[:, gx, gy, gz].permute(1,0).to(torch.float32)  # (V,3)
+        est_centers = uc.to(torch.float32) + off_active
+    else:
+        est_centers = uc.to(torch.float32)
+
+    r = float(assign_radius_vox)
+    gate = (
+        (torch.abs(est_centers[:,0:1] - centers_vox[None,:,0]) <= r) &
+        (torch.abs(est_centers[:,1:2] - centers_vox[None,:,1]) <= r) &
+        (torch.abs(est_centers[:,2:3] - centers_vox[None,:,2]) <= r)
+    )
+
+    V = uc.shape[0]
+    nearest = torch.full((V,), -1, device=device, dtype=torch.long)
+    mind2   = torch.full((V,), float('inf'), device=device, dtype=torch.float32)
+
+    if K > 0:
+        for s in range(0, K, chunk_K):
+            e = min(K, s+chunk_K)
+            mask = gate[:, s:e]
+            if not mask.any():
+                continue
+            idx_v, idx_k_local = torch.where(mask)
+            cands = centers_vox[s:e][idx_k_local]
+            vpos  = est_centers[idx_v]
+            d2 = ((vpos - cands)**2).sum(dim=1)
+            cur_best = mind2[idx_v]
+            better   = d2 < cur_best
+            if better.any():
+                mind2[idx_v[better]] = d2[better]
+                nearest[idx_v[better]] = (s + idx_k_local[better]).to(nearest.dtype)
+
+    assign = torch.where(mind2 <= (r*r), nearest, torch.full_like(nearest, -1))
+    vox_cls = pred_c[gx,gy,gz]
+
+    if logits_p is not None and logits_p.numel() > 0:
+        pred_p = logits_p.argmax(1)[0]
+        vox_prof = pred_p[gx,gy,gz]
+    else:
+        vox_prof = None
+
+    return dict(centers_vox=centers_vox, scores=scores, assign=assign,
+                vox_cls=vox_cls, vox_prof=vox_prof, uc=uc)
+
+# ----------------------- Connections / merging by profile ---------------------
+def iou3d(a_min, a_max, b_min, b_max):
+    """Axis-aligned 3D IoU; inputs are (3,) numpy arrays."""
+    inter_min = np.maximum(a_min, b_min)
+    inter_max = np.minimum(a_max, b_max)
+    inter_sz  = np.maximum(0.0, inter_max - inter_min)
+    inter_vol = inter_sz[0] * inter_sz[1] * inter_sz[2]
+    if inter_vol <= 0.0:
+        return 0.0, inter_vol
+    vol_a = np.prod(np.maximum(0.0, a_max - a_min))
+    vol_b = np.prod(np.maximum(0.0, b_max - b_min))
+    union = max(vol_a + vol_b - inter_vol, 1e-9)
+    return float(inter_vol / union), float(inter_vol)
+
+class UnionFind:
+    def __init__(self, n):
+        self.p = list(range(n))
+        self.sz = [1]*n
+    def find(self, x):
+        while self.p[x] != x:
+            self.p[x] = self.p[self.p[x]]
+            x = self.p[x]
+        return x
+    def union(self, a, b):
+        ra, rb = self.find(a), self.find(b)
+        if ra == rb: return False
+        if self.sz[ra] < self.sz[rb]: ra, rb = rb, ra
+        self.p[rb] = ra
+        self.sz[ra] += self.sz[rb]
+        return True
+
+def connect_and_merge_by_profile(detections, iou_threshold=0.0, require_same_class=True):
+    """
+    Connect candidates that share the SAME profile (and class if require_same_class)
+    and whose 3D boxes overlap (IoU > threshold, default any intersection).
+    Returns merged detections + connection graph.
+    """
+    if not detections:
+        return [], [], []
+
+    # Index by (class, profile) buckets
+    buckets = {}
+    for idx, det in enumerate(detections):
+        c = det.get('class_id', -1)
+        p = det.get('profile_id', None)
+        key = (c, p if p is not None else -1) if require_same_class else ('ANY', p if p is not None else -1)
+        buckets.setdefault(key, []).append((idx, det))
+
+    merged_all = []
+    edges_all  = []
+    groups_all = []
+
+    for key, items in buckets.items():
+        n = len(items)
+        uf = UnionFind(n)
+        # Pairwise connect on overlap
+        for i in range(n):
+            _, di = items[i]
+            for j in range(i+1, n):
+                _, dj = items[j]
+                iou, inter_vol = iou3d(
+                    np.array(di['bbox_world_min'], dtype=float),
+                    np.array(di['bbox_world_max'], dtype=float),
+                    np.array(dj['bbox_world_min'], dtype=float),
+                    np.array(dj['bbox_world_max'], dtype=float),
+                )
+                if (inter_vol > 0.0 and iou > iou_threshold):
+                    if uf.union(i, j):
+                        # store an edge using original cand IDs for traceability
+                        edges_all.append((di['id'], dj['id']))
+
+        # Build components
+        comp = {}
+        for local_idx, (orig_idx, det) in enumerate(items):
+            r = uf.find(local_idx)
+            comp.setdefault(r, []).append((orig_idx, det))
+
+        # Merge each component
+        for comp_members in comp.values():
+            # Collect fields
+            ids          = [d['id'] for _, d in comp_members]
+            cls_id       = comp_members[0][1]['class_id']
+            cls_name     = comp_members[0][1]['class_name']
+            prof_id      = comp_members[0][1].get('profile_id', None)
+            prof_name    = comp_members[0][1].get('profile_name', None)
+
+            wmins = np.stack([np.array(d['bbox_world_min'], float) for _, d in comp_members], axis=0)
+            wmaxs = np.stack([np.array(d['bbox_world_max'], float) for _, d in comp_members], axis=0)
+            wmin = wmins.min(axis=0)
+            wmax = wmaxs.max(axis=0)
+
+            # Center: weighted by point counts if available
+            centers = np.stack([np.array(d['center_world'], float) for _, d in comp_members], axis=0)
+            sizes   = np.array([len(d.get('point_indices', [])) for _, d in comp_members], dtype=np.float64)
+            if sizes.sum() <= 0: sizes = np.ones_like(sizes)
+            center_w = (centers * (sizes[:,None]/sizes.sum())).sum(axis=0)
+
+            # Score: max over members (or mean—your choice)
+            scores = [float(d.get('score', 0.0)) for _, d in comp_members]
+            score  = float(np.max(scores))
+
+            # Points: union (sorted unique to keep stable)
+            pts = np.concatenate([d.get('point_indices', np.zeros((0,), np.int64)) for _, d in comp_members], axis=0)
+            if pts.size:
+                pts = np.unique(pts.astype(np.int64))
+            else:
+                pts = np.zeros((0,), np.int64)
+
+            merged_all.append(dict(
+                id=int(min(ids)),                  # keep smallest original id for stability
+                member_ids=[int(x) for x in sorted(ids)],
+                class_id=cls_id, class_name=cls_name,
+                profile_id=(int(prof_id) if prof_id is not None else None),
+                profile_name=prof_name,
+                center_world=tuple(center_w.tolist()),
+                bbox_world_min=wmin.astype(float),
+                bbox_world_max=wmax.astype(float),
+                point_indices=pts,
+                score=score,
+            ))
+            groups_all.append([int(x) for x in sorted(ids)])
+
+    # Optional: sort merged by score desc
+    merged_all.sort(key=lambda d: d.get('score', 0.0), reverse=True)
+    return merged_all, edges_all, groups_all
+
+# --------------------------- Main inference function --------------------------
+@torch.no_grad()
+def infer_instances_fast(
+    points_world: np.ndarray,
+    ckpt_dir: str,
+    ckpt_name: str = "epoch_1.pth",
+    device: str = "cuda",
+    center_thresh: float = 0.35,
+    nms_kernel: int = 7,
+    max_instances: int = 256,
+    assign_radius_vox: float = 6.0,
+    verbose: bool = False,
+    timings: dict | None = None,
+    connect_profiles: bool = True,        # NEW: enable connection/merge
+    iou_merge_threshold: float = 0.0,     # NEW: any intersection by default
+    require_same_class: bool = True       # NEW: also require class to match
+):
+    t0 = time.perf_counter()
+
+    # cached model + meta
+    model, meta = load_model_once(ckpt_dir, ckpt_name)
+    classes_map   = meta.get("classes", {})
+    id2cls        = {int(v): str(k) for k,v in classes_map.items()}
+    profiles_map  = meta.get("profiles", {})
+    id2profile    = {int(v): str(k) for k,v in profiles_map.items()} if profiles_map else {}
+    allowed_per_class = meta.get("allowed_per_class", {})
+
+    enable_bev    = bool(meta.get("enable_bev_head", True))
+    grid_size     = int(meta.get("grid_size", 128))
+    voxel_size    = float(meta.get("voxel_size", 0.03))
+    use_profiles  = bool(meta.get("use_profiles", True))
+
+    cfg = types.SimpleNamespace(
+        voxel_size_m=voxel_size, grid_size=grid_size, pad_empty_border=1,
+        auto_fit_voxel_size=True, auto_fit_cover_frac=0.95,
+        auto_fit_min_vs=0.01, auto_fit_max_vs=0.20,
+        use_relative_coords=True, coorddrop_p=0.0, origin_jitter_frac=0.0,
+        enable_bev_head=enable_bev, bev_band_only=True, use_profiles=use_profiles,
+        debug_prints=verbose
+    )
+
+    t_load = time.perf_counter()
+
+    # features
+    feats32, _, _, meta_v = fast_voxel_features(points_world, cfg)
+    t_vox = time.perf_counter()
+    if meta_v.get("empty", False):
+        if timings is not None:
+            timings.update(dict(load=t_load-t0, voxelize=t_vox-t_load, forward=0.0, decode=0.0))
+        return {
+            'detections': [],
+            'detections_merged': [],
+            'connections': [],
+            'groups': [],
+            'meta': {'grid_origin_m': meta_v.get('grid_origin_m'),
+                     'voxel_size_m': cfg.voxel_size_m, 'grid_size': cfg.grid_size}
+        }
+
+    # crop to active ROI
+    feats_crop32, back_meta = crop_active_roi(feats32, meta_v["uc"], margin=2)
+    D0,H0,W0 = feats_crop32.shape[1:]
+
+    # pad cropped tensor to multiple of 16 (UNet-safe)
+    feats_crop16 = feats_crop32.astype(np.float16, copy=False)
+    feats_pad16, (pd, ph, pw), orig_shape = pad_to_multiple_3d(feats_crop16, multiple=16)
+
+    # upload
+    X = torch.from_numpy(feats_pad16).unsqueeze(0)  # (1,7,d,h,w) fp16
+    if _DEVICE.type == "cuda":
+        X = X.pin_memory().to(_DEVICE, dtype=torch.float16, non_blocking=True)
+    else:
+        X = X.to(_DEVICE)
+    X = to_cl3d_safe(X)
+    band = X[:, 5:6].contiguous()
+
+    # forward
+    t_f0 = time.perf_counter()
+    with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=(_DEVICE.type=="cuda")):
+        logits_c, logits_p, logits_ctr, logits_off, _ = model(X, band=band)
+    if _DEVICE.type == "cuda":
+        torch.cuda.synchronize()
+    t_f1 = time.perf_counter()
+
+    # slice logits back to unpadded crop size
+    logits_c  = unpad_logits_to_shape(logits_c,  orig_shape)
+    logits_ctr= unpad_logits_to_shape(logits_ctr, orig_shape)
+    logits_off= unpad_logits_to_shape(logits_off, orig_shape) if (logits_off is not None) else None
+    logits_p  = unpad_logits_to_shape(logits_p,  orig_shape) if (logits_p   is not None) else None
+
+    # decode in cropped coords (shift uc by -offset)
+    dec = decode_gpu_fast(
+        logits_c, logits_p, logits_ctr, logits_off,
+        meta_v=dict(uc=meta_v["uc"] - np.array(back_meta["offset"], dtype=np.int32)),
+        center_thresh=center_thresh, nms_kernel=nms_kernel,
+        max_instances=max_instances, assign_radius_vox=assign_radius_vox,
+        topk_global=max_instances, chunk_K=256
+    )
+    # shift centers/uc back to full-grid coords
+    def offset_back(t):
+        if t is None: return None
+        return t + torch.tensor(list(back_meta["offset"]), dtype=t.dtype, device=t.device)
+    centers_vox = offset_back(dec["centers_vox"])
+    uc_full     = offset_back(dec["uc"])
+
+    if centers_vox is None:
+        if timings is not None:
+            timings.update(dict(load=t_load-t0, voxelize=t_vox-t_load, forward=t_f1-t_f0, decode=(time.perf_counter()-t_f1)))
+        return {
+            'detections': [],
+            'detections_merged': [],
+            'connections': [],
+            'groups': [],
+            'meta': {'grid_origin_m': meta_v.get('grid_origin_m'),
+                     'voxel_size_m': cfg.voxel_size_m, 'grid_size': grid_size}
+        }
+
+    if _DEVICE.type == "cuda":
+        torch.cuda.synchronize()
+    t_dec = time.perf_counter()
+
+    # numpy gather
+    centers_vox = centers_vox.detach().cpu().numpy()
+    scores      = dec["scores"].detach().cpu().numpy()
+    assign      = dec["assign"].detach().cpu().numpy()
+    vox_cls     = dec["vox_cls"].detach().cpu().numpy().astype(np.int32)
+    vox_prof    = (dec["vox_prof"].detach().cpu().numpy().astype(np.int32)
+                   if dec["vox_prof"] is not None else None)
+    uc          = uc_full.detach().cpu().numpy().astype(np.int32)
+
+    grid_origin = meta_v.get('grid_origin_m', np.zeros(3, np.float32))
+    vs          = float(meta_v.get('voxel_size_m', cfg.voxel_size_m))
+
+    inv        = meta_v["inv"]
+    valid_mask = meta_v["valid_mask"]
+    Ntot = points_world.shape[0]
+    point_inst = np.full((Ntot,), -1, np.int32)
+    if uc.shape[0] > 0:
+        inst_ids_compact = assign
+        point_inst_compact = inst_ids_compact[inv]
+        point_inst[valid_mask] = point_inst_compact
+
+    detections = []
+    id2cls      = {int(v): str(k) for k,v in classes_map.items()}
+    id2profile  = {int(v): str(k) for k,v in profiles_map.items()} if profiles_map else {}
+    allowed_per_class = meta.get("allowed_per_class", {})
+
+    uniq_inst = sorted(set(int(i) for i in assign if i >= 0))
+    for kidx in uniq_inst:
+        vox_sel = (assign == kidx)
+        if not np.any(vox_sel): continue
+        vox_ids = np.nonzero(vox_sel)[0]
+
+        cls_vals, cls_cnts = np.unique(vox_cls[vox_ids], return_counts=True)
+        cls_id = int(cls_vals[cls_cnts.argmax()])
+        cls_name = id2cls.get(cls_id, f"class_{cls_id}")
+
+        prof_id = -1; prof_name = None
+        if vox_prof is not None:
+            if allowed_per_class:
+                allowed = allowed_per_class.get(str(int(cls_id)), None)
+                if allowed:
+                    legal = np.array(sorted(set(int(a) for a in allowed)), dtype=np.int64)
+                    mask = np.isin(vox_prof[vox_ids], legal)
+                    use = vox_prof[vox_ids][mask] if mask.any() else vox_prof[vox_ids]
+                else:
+                    use = vox_prof[vox_ids]
+            else:
+                use = vox_prof[vox_ids]
+            pvals, pcnts = np.unique(use, return_counts=True)
+            prof_id = int(pvals[pcnts.argmax()])
+            prof_name = id2profile.get(prof_id, None) if prof_id >= 0 else None
+
+        coords = uc[vox_ids].astype(np.int32)
+        vmin = coords.min(axis=0); vmax = coords.max(axis=0)
+        wmin = grid_origin + vmin.astype(np.float32) * vs
+        wmax = grid_origin + (vmax.astype(np.float32) + 1.0) * vs
+
+        score = float(scores[kidx]) if kidx < len(scores) else 0.0
+        pts_idx = np.nonzero(point_inst == kidx)[0]
+
+        detections.append(dict(
+            id=int(kidx),
+            class_id=cls_id, class_name=cls_name,
+            profile_id=(prof_id if prof_id>=0 else None), profile_name=prof_name,
+            center_world=tuple((grid_origin + (centers_vox[kidx] + 0.5) * vs).tolist()),
+            bbox_world_min=wmin.astype(float), bbox_world_max=wmax.astype(float),
+            point_indices=pts_idx.astype(np.int64),
+            score=score
+        ))
+
+    # NEW: connect & merge by profile
+    if connect_profiles:
+        det_merged, edges, groups = connect_and_merge_by_profile(
+            detections,
+            iou_threshold=iou_merge_threshold,
+            require_same_class=require_same_class
+        )
+    else:
+        det_merged, edges, groups = list(detections), [], [[d['id']] for d in detections]
+
+    if timings is not None:
+        timings.update(dict(load=t_load-t0, voxelize=t_vox-t_load, forward=t_f1-t_f0, decode=t_dec-t_f1))
+
+    return {
+        'detections': detections,               # raw per-candidate
+        'detections_merged': det_merged,        # merged by profile overlap (full connection)
+        'connections': edges,                   # list of (orig_id_i, orig_id_j) edges
+        'groups': groups,                       # list of groups (original ids per merged comp)
+        'meta': {'grid_origin_m': grid_origin, 'voxel_size_m': vs, 'grid_size': grid_size}
+    }
+
+# ---------------------- Build/Reuse ONE mesh for ALL boxes --------------------
+def build_or_update_boxes(name: str, detections):
+    import bpy, bmesh
+    verts = []; edges = []
+    def add_box(wmin, wmax):
+        x0,y0,z0 = wmin; x1,y1,z1 = wmax
+        idx0 = len(verts)
+        verts.extend([
+            (x0,y0,z0),(x1,y0,z0),(x1,y1,z0),(x0,y1,z0),
+            (x0,y0,z1),(x1,y0,z1),(x1,y1,z1),(x0,y1,z1),
+        ])
+        e = [
+            (0,1),(1,2),(2,3),(3,0),
+            (4,5),(5,6),(6,7),(7,4),
+            (0,4),(1,5),(2,6),(3,7),
+        ]
+        for a,b in e: edges.append((idx0+a, idx0+b))
+
+    for det in detections:
+        wmin = np.array(det['bbox_world_min'], dtype=float)
+        wmax = np.array(det['bbox_world_max'], dtype=float)
+        add_box(wmin, wmax)
+
+    obj = bpy.data.objects.get(name)
+    if obj and obj.type == 'MESH':
+        me = obj.data
+        bm = bmesh.new()
+        bm_verts = [bm.verts.new(v) for v in verts]
+        bm.verts.ensure_lookup_table()
+        for a,b in edges:
+            try: bm.edges.new((bm_verts[a], bm_verts[b]))
+            except ValueError: pass
+        bm.to_mesh(me); bm.free()
+        return obj
+
+    me = bpy.data.meshes.new(name + "_mesh")
+    bm = bmesh.new()
+    bm_verts = [bm.verts.new(v) for v in verts]
+    bm.verts.ensure_lookup_table()
+    for a,b in edges:
+        try: bm.edges.new((bm_verts[a], bm_verts[b]))
+        except ValueError: pass
+    bm.to_mesh(me); bm.free()
+
+    obj = bpy.data.objects.new(name, me)
+    obj.display_type = 'WIRE'
+    obj.show_wire = True
+    obj.show_all_edges = True
+
+    mat = bpy.data.materials.get(name+"_mat") or make_emission_material(name+"_mat", (1, 0.8, 0.1))
+    if obj.data.materials:
+        obj.data.materials[0] = mat
+    else:
+        obj.data.materials.append(mat)
+    return obj
+
+# ---------------------------------- MAIN -------------------------------------
+if __name__ == "__main__":
+    try:
+        import bpy
+        BLEND_DIR = os.path.dirname(bpy.data.filepath)
+
+        # User params
+        OBJ_NAME   = "SceneSensor"
+        CKPT_DIR   = os.path.join(BLEND_DIR, "checkpoints", "unet3d_pca_surface_features")
+        CKPT_NAME  = "epoch_1.pth"
+        CENTER_THR = 0.35
+        NMS_K      = 7
+        RADIUS_VOX = 6.0
+        MAX_INST   = 256
+
+        tA = time.perf_counter()
+        gc.disable()
+
+        P = get_points_from_bpy_object(OBJ_NAME)
+        tB = time.perf_counter()
+
+        T = {}
+        result = infer_instances_fast(
+            P, CKPT_DIR, ckpt_name=CKPT_NAME, device="cuda",
+            center_thresh=CENTER_THR, nms_kernel=NMS_K,
+            assign_radius_vox=RADIUS_VOX, max_instances=MAX_INST,
+            verbose=False, timings=T,
+            connect_profiles=True,           # connect/merge ON
+            iou_merge_threshold=0.0,         # any intersection merges
+            require_same_class=True
+        )
+
+        # prefer merged boxes for visualization
+        dets_merged = result['detections_merged']
+        det_coll = ensure_collection("Detections")
+
+        tC = time.perf_counter()
+        boxes_obj = build_or_update_boxes("Detections_Wire", dets_merged if dets_merged else result['detections'])
+        if boxes_obj.name not in det_coll.objects:
+            det_coll.objects.link(boxes_obj)
+        tD = time.perf_counter()
+
+        print("[detect-fast] points_read={:.3f}s  load={:.3f}s  voxelize={:.3f}s  forward={:.3f}s  decode={:.3f}s  link/build={:.3f}s  total={:.3f}s".format(
+            (tB - tA), T.get('load',0.0), T.get('voxelize',0.0), T.get('forward',0.0), T.get('decode',0.0),
+            (tD - tC), (tD - tA)
+        ))
+        print(f"[detect-fast] raw={len(result['detections'])} merged={len(dets_merged)} connections={len(result['connections'])} groups={len(result['groups'])}")
+
+        # Show a few merged groups
+        for det in dets_merged[:10]:
+            print("  - merged_id={} members={} class={} profile={} pts={} score={:.3f}".format(
+                det['id'], det.get('member_ids', []), det['class_name'],
+                (det['profile_name'] if det['profile_name'] else "None"),
+                int(len(det.get('point_indices', []))), float(det.get('score', 0.0))
+            ))
+
+        gc.enable()
+
+    except Exception as e:
+        print("[detect-fast ERROR]", e)
