@@ -1,4 +1,4 @@
-# 3DVoxelBasedSparseU-NetSegmentation (H1)4
+# 3DVoxelBasedSparseU-NetSegmentation (H1)
 ## I want to create a segmentation method that is capable of multi-instancing humans in real-time and identifying pose patterns from 3D data.
 
 
