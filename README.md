@@ -3,17 +3,18 @@
 
 
 The goal was simple, Create a basic pattern recognition architecture that could detect any bit of training data from arbituary but limited sets. After feeding it only 2 meshes a female and a male mesh as well as a lot of background information (Planes, Shapes, Meshes, anything NOT human) it was able to determine the location of humans in under a second flat 
----
+
 <img width="1476" height="497" alt="image" src="https://github.com/user-attachments/assets/e95315e4-0b0c-45aa-a464-c8795df5a483" />
-```
+
 I gave it very sparse and few data yet it was even able to detect a human it's never even seen before in training, the posed human (SHOWN BELOW) was never present in any of the training data nor was it even close to relevant size. After doing some Point Sampling (where we take the nearest denser points, I know right...) we are able to accurately determine the most plausible candidates location (as well as a bounding box around the points designated) and print them to the screen in 0.502 ms. However given that most of the Performance is bogged down by the actual wireframe we're building to PRINT to said screen the time is actually significantly less, I'll know more when I finish the implementation.
-```
+---
 <img width="1461" height="51" alt="image" src="https://github.com/user-attachments/assets/3009efea-def4-4045-8514-45651902eac1" />
-```
+
 The image clearly shows a finish time of 0.502s as does the code but that doesn't take into account the recorded time it takes to actually build the wireframe. Meaning the actual time that it would take to FORWARD data using a temporal like model frame by frame is 0.204s or 204 ms. Not bad taking into account that we'd be reading point cloud data and looking for plausible candidates frame by frame, this can be signicantly reduced in future implementations.
-```
+---
 
 <img width="1192" height="577" alt="image" src="https://github.com/user-attachments/assets/ac94a44f-2322-4bb9-a893-79a05fc1851a" />
+
 
 
 Finally had time to push all of my work, Research Notes coming soon...
