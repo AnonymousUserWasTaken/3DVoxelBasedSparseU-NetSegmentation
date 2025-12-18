@@ -10,7 +10,7 @@ I gave it very sparse and few data yet it was even able to detect a human it's n
 ---
 <img width="1461" height="51" alt="image" src="https://github.com/user-attachments/assets/3009efea-def4-4045-8514-45651902eac1" />
 
-The image clearly shows a finish time of 0.502s as does the code but that doesn't take into account the recorded time it takes to actually build the wireframe. Meaning the actual time that it would take to FORWARD data using a temporal like model frame by frame is 0.204s or 204 ms. Not bad taking into account that we'd be reading point cloud data and looking for plausible candidates frame by frame, this can be signicantly reduced in future implementations.
+The image clearly shows a finish time of 0.541s as does the code but that doesn't take into account the recorded time it takes to actually build the wireframe. Meaning the actual time that it would take to FORWARD data using a temporal like model frame by frame is 0.204s or 204 ms. Not bad taking into account that we'd be reading point cloud data and looking for plausible candidates frame by frame, this can be signicantly reduced in future implementations.
 ---
 
 <img width="1192" height="577" alt="image" src="https://github.com/user-attachments/assets/ac94a44f-2322-4bb9-a893-79a05fc1851a" />
