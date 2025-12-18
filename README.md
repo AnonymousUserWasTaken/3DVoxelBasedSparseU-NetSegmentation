@@ -6,7 +6,7 @@ The goal was simple, Create a basic pattern recognition architecture that could 
 
 <img width="1476" height="497" alt="image" src="https://github.com/user-attachments/assets/e95315e4-0b0c-45aa-a464-c8795df5a483" />
 
-I gave it very sparse and few data yet it was even able to detect a human it's never even seen before in training, the posed human (SHOWN BELOW) was never present in any of the training data nor was it even close to relevant size. After doing some Point Sampling (where we take the nearest denser points, I know right...) we are able to accurately determine the most plausible candidates location (as well as a bounding box around the points designated) and print them to the screen in 0.502 ms. However given that most of the Performance is bogged down by the actual wireframe we're building to PRINT to said screen the time is actually significantly less, I'll know more when I finish the implementation.
+I gave it very sparse and few data yet it was even able to detect a human it's never even seen before in training, the posed human (SHOWN BELOW) was never present in any of the training data nor was it even close to relevant size. After doing some Point Sampling (where we take the nearest denser points, I know right...) we are able to accurately determine the most plausible candidates location (as well as a bounding box around the points designated) and print them to the screen in 0.541s. However given that most of the Performance is bogged down by the actual wireframe we're building to PRINT to said screen the time is actually significantly less, I'll know more when I finish the implementation.
 ---
 <img width="1461" height="51" alt="image" src="https://github.com/user-attachments/assets/3009efea-def4-4045-8514-45651902eac1" />
 
