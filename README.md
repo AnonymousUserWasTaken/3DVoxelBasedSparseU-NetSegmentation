@@ -2,7 +2,7 @@
 ## I want to create a segmentation method that is capable of multi-instancing humans in real-time + deriving pose patterns from 3D data.
 
 
-The goal was simple, Create a basic pattern recognition architecture that could detect any bit of training data from arbituary but limited sets. After feeding it only 2 meshes a female and a male mesh as well as a lot of background information (Planes, Shapes, Meshes, anything NOT human) it was able to determine the location of humans in under a second flat 
+The goal was simple, Create a basic pattern recognition architecture that could detect any bit of training data from arbituary but limited training sets locally. After feeding it only 2 meshes a female and a male mesh as well as a lot of background information (Planes, Shapes, Meshes, anything NOT human) it was able to determine the location of humans in under a second.
 
 <img width="1476" height="497" alt="image" src="https://github.com/user-attachments/assets/e95315e4-0b0c-45aa-a464-c8795df5a483" />
 
